@@ -1,0 +1,338 @@
+# %% [markdown]
+# # Data Fidelity Loss Ratio (DFLR) Analysis for IFC Export
+# **Author:** Based on research by Umaira Shahid et al.
+# **Purpose:** Quantify data loss when exporting Revit models to IFC4 (Design Transfer View) for Doors, Structural Columns, and Floors.
+# 
+# This notebook:
+# 1. Loads **before‑export** schedules (CSV/Excel) and **after‑export** IFC data (extracted via ifcopenshell).
+# 2. Aligns records using unique identifiers (e.g., `Mark` for doors, `Column Location Mark` for columns, `Name` for floors).
+# 3. Computes **record‑level** and **parameter‑level** fidelity.
+# 4. Calculates **overall DFLR** and visualises results.
+# 
+# ## How to use
+# 1. Upload your files when prompted.
+# 2. For each element type (doors, columns, floors) you need:
+#    - **Before export**: a CSV/Excel file with all parameters.
+#    - **After export**: an IFC file (or a CSV extracted from it).  
+#      *The notebook includes an optional section to extract data from an IFC file using `ifcopenshell`.*
+# 3. Run all cells.
+
+# %% [markdown]
+# ### 0. Install required packages (run once)
+
+# %%
+!pip install pandas numpy matplotlib seaborn ifcopenshell openpyxl
+
+# %% [markdown]
+# ### 1. Import libraries
+
+# %%
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from google.colab import files
+import io
+import warnings
+warnings.filterwarnings('ignore')
+
+# %% [markdown]
+# ### 2. Helper functions for DFLR calculation
+
+# %%
+def compute_record_fidelity(before_df, after_df, key_column):
+    """
+    Compute record-level fidelity.
+    before_df, after_df: DataFrames with a common unique key column.
+    Returns: record_fidelity (%), missing_in_after, extra_in_after.
+    """
+    before_keys = set(before_df[key_column].astype(str))
+    after_keys = set(after_df[key_column].astype(str))
+    
+    common = before_keys.intersection(after_keys)
+    record_fidelity = len(common) / len(before_keys) * 100 if len(before_keys) > 0 else 0
+    
+    missing = before_keys - after_keys
+    extra = after_keys - before_keys
+    return record_fidelity, missing, extra
+
+def compute_parameter_fidelity(before_df, after_df, key_column, parameters):
+    """
+    For each parameter, compute the percentage of records where the value matches exactly.
+    Only considers records that exist in both DataFrames.
+    Returns dict: {parameter: fidelity_percentage}
+    """
+    # Merge on key column
+    merged = pd.merge(before_df, after_df, on=key_column, suffixes=('_before', '_after'))
+    fidelity = {}
+    for param in parameters:
+        if param+'_before' in merged.columns and param+'_after' in merged.columns:
+            # Compare values as strings to avoid type issues
+            before_vals = merged[param+'_before'].astype(str)
+            after_vals = merged[param+'_after'].astype(str)
+            matches = (before_vals == after_vals).sum()
+            total = len(merged)
+            fidelity[param] = (matches / total * 100) if total > 0 else 0
+        else:
+            fidelity[param] = 0.0
+    return fidelity
+
+def compute_overall_dflr(before_df, after_df, key_column, parameters):
+    """
+    Compute overall weighted DFLR:
+    - total cells = (number of records in before) * (number of parameters)
+    - matched cells = sum over parameters of (number of matching records for that parameter)
+    DFLR = 1 - (matched_cells / total_cells)
+    """
+    # Merge on key to get common records only (conservative approach)
+    merged = pd.merge(before_df, after_df, on=key_column, suffixes=('_before', '_after'))
+    total_records = len(merged)
+    total_cells = total_records * len(parameters)
+    matched_cells = 0
+    for param in parameters:
+        if param+'_before' in merged.columns and param+'_after' in merged.columns:
+            before_vals = merged[param+'_before'].astype(str)
+            after_vals = merged[param+'_after'].astype(str)
+            matched_cells += (before_vals == after_vals).sum()
+    dflr = (1 - matched_cells / total_cells) * 100 if total_cells > 0 else 100
+    return dflr
+
+def plot_fidelity(fidelity_dict, title):
+    """Plot parameter fidelity as a horizontal bar chart."""
+    params = list(fidelity_dict.keys())
+    values = list(fidelity_dict.values())
+    plt.figure(figsize=(10, 6))
+    bars = plt.barh(params, values, color='skyblue')
+    plt.xlabel('Fidelity (%)')
+    plt.title(title)
+    plt.xlim(0, 100)
+    for bar, val in zip(bars, values):
+        plt.text(val + 1, bar.get_y() + bar.get_height()/2, f'{val:.1f}%', va='center')
+    plt.tight_layout()
+    plt.show()
+
+# %% [markdown]
+# ### 3. Upload and prepare data for each element type
+# 
+# **Important:** Your before‑export files should contain a unique identifier column:
+# - **Doors:** `Mark` (door number)
+# - **Structural Columns:** `Column Location Mark` (or similar unique ID)
+# - **Floors:** `Name` or `Type` + `Level` combination (create a composite key)
+# 
+# The after‑export data can be either:
+# - A CSV extracted from IFC (using e.g., `ifcopenshell` or BIM software)
+# - Or you can directly provide an IFC file – the notebook includes a function to extract property sets.
+# 
+# We first demonstrate using CSV files. If you have IFC files, see the optional section.
+
+# %% [markdown]
+# #### 3.1 Doors analysis
+
+# %%
+# Upload before-export door schedule (e.g., door_schedule_before.csv)
+print("Upload BEFORE export door schedule (CSV or Excel):")
+door_before_file = files.upload()
+door_before = None
+for fn in door_before_file.keys():
+    if fn.endswith('.csv'):
+        door_before = pd.read_csv(io.BytesIO(door_before_file[fn]))
+    else:
+        door_before = pd.read_excel(io.BytesIO(door_before_file[fn]), sheet_name=0)
+    break
+
+# Upload after-export door data (CSV extracted from IFC)
+print("Upload AFTER export door data (CSV):")
+door_after_file = files.upload()
+door_after = None
+for fn in door_after_file.keys():
+    door_after = pd.read_csv(io.BytesIO(door_after_file[fn]))
+    break
+
+# Define key column and parameters for doors
+DOOR_KEY = 'Mark'           # unique identifier
+DOOR_PARAMS = ['Level', 'Rough Height', 'Rough Width', 'Family', 'Type']
+
+# Show first few rows
+print("Before export (first 5 rows):")
+print(door_before.head())
+print("\nAfter export (first 5 rows):")
+print(door_after.head())
+
+# Compute DFLR
+record_fid, missing, extra = compute_record_fidelity(door_before, door_after, DOOR_KEY)
+param_fid = compute_parameter_fidelity(door_before, door_after, DOOR_KEY, DOOR_PARAMS)
+overall_dflr = compute_overall_dflr(door_before, door_after, DOOR_KEY, DOOR_PARAMS)
+
+print("\n=== DOORS DFLR RESULTS ===")
+print(f"Record fidelity: {record_fid:.2f}%")
+print(f"Missing records (in after): {missing}")
+print(f"Extra records (in after): {extra}")
+print(f"Overall DFLR: {overall_dflr:.2f}%")
+print("\nParameter-level fidelity:")
+for p, f in param_fid.items():
+    print(f"  {p}: {f:.2f}%")
+
+plot_fidelity(param_fid, "Door Parameter Fidelity")
+
+# %% [markdown]
+# #### 3.2 Structural Columns analysis
+
+# %%
+# Upload before-export column schedule
+print("Upload BEFORE export column schedule (CSV/Excel):")
+col_before_file = files.upload()
+col_before = None
+for fn in col_before_file.keys():
+    if fn.endswith('.csv'):
+        col_before = pd.read_csv(io.BytesIO(col_before_file[fn]))
+    else:
+        col_before = pd.read_excel(io.BytesIO(col_before_file[fn]), sheet_name=0)
+    break
+
+# Upload after-export column data
+print("Upload AFTER export column data (CSV):")
+col_after_file = files.upload()
+col_after = None
+for fn in col_after_file.keys():
+    col_after = pd.read_csv(io.BytesIO(col_after_file[fn]))
+    break
+
+COL_KEY = 'Column Location Mark'   # adjust to your column
+COL_PARAMS = ['Base Level', 'Top Level', 'Length', 'Volume', 'Family and Type']
+
+print("\nBefore export columns:")
+print(col_before.head())
+print("\nAfter export columns:")
+print(col_after.head())
+
+record_fid, missing, extra = compute_record_fidelity(col_before, col_after, COL_KEY)
+param_fid = compute_parameter_fidelity(col_before, col_after, COL_KEY, COL_PARAMS)
+overall_dflr = compute_overall_dflr(col_before, col_after, COL_KEY, COL_PARAMS)
+
+print("\n=== STRUCTURAL COLUMNS DFLR RESULTS ===")
+print(f"Record fidelity: {record_fid:.2f}%")
+print(f"Missing records: {missing}")
+print(f"Extra records: {extra}")
+print(f"Overall DFLR: {overall_dflr:.2f}%")
+print("\nParameter-level fidelity:")
+for p, f in param_fid.items():
+    print(f"  {p}: {f:.2f}%")
+
+plot_fidelity(param_fid, "Structural Column Parameter Fidelity")
+
+# %% [markdown]
+# #### 3.3 Floors analysis
+
+# %%
+# Upload before-export floor schedule
+print("Upload BEFORE export floor schedule (CSV/Excel):")
+floor_before_file = files.upload()
+floor_before = None
+for fn in floor_before_file.keys():
+    if fn.endswith('.csv'):
+        floor_before = pd.read_csv(io.BytesIO(floor_before_file[fn]))
+    else:
+        floor_before = pd.read_excel(io.BytesIO(floor_before_file[fn]), sheet_name=0)
+    break
+
+# Upload after-export floor data
+print("Upload AFTER export floor data (CSV):")
+floor_after_file = files.upload()
+floor_after = None
+for fn in floor_after_file.keys():
+    floor_after = pd.read_csv(io.BytesIO(floor_after_file[fn]))
+    break
+
+# For floors, use a composite key (e.g., Level + Name) if unique
+floor_before['CompositeKey'] = floor_before['Level'].astype(str) + "_" + floor_before['Name'].astype(str)
+floor_after['CompositeKey'] = floor_after['Level'].astype(str) + "_" + floor_after['Name'].astype(str)
+FLOOR_KEY = 'CompositeKey'
+FLOOR_PARAMS = ['Area', 'Volume', 'Default Thickness', 'Structural Material', 'Type']
+
+print("\nBefore export floors:")
+print(floor_before.head())
+print("\nAfter export floors:")
+print(floor_after.head())
+
+record_fid, missing, extra = compute_record_fidelity(floor_before, floor_after, FLOOR_KEY)
+param_fid = compute_parameter_fidelity(floor_before, floor_after, FLOOR_KEY, FLOOR_PARAMS)
+overall_dflr = compute_overall_dflr(floor_before, floor_after, FLOOR_KEY, FLOOR_PARAMS)
+
+print("\n=== FLOORS DFLR RESULTS ===")
+print(f"Record fidelity: {record_fid:.2f}%")
+print(f"Missing records: {missing}")
+print(f"Extra records: {extra}")
+print(f"Overall DFLR: {overall_dflr:.2f}%")
+print("\nParameter-level fidelity:")
+for p, f in param_fid.items():
+    print(f"  {p}: {f:.2f}%")
+
+plot_fidelity(param_fid, "Floor Parameter Fidelity")
+
+# %% [markdown]
+# ### 4. Optional: Extract data directly from an IFC file (using ifcopenshell)
+# 
+# If you have the IFC file after export, you can extract property sets and geometry parameters automatically.  
+# Uncomment and run the cell below, then upload your IFC file.
+
+# %%
+"""
+import ifcopenshell
+from ifcopenshell import util
+
+def extract_doors_from_ifc(ifc_path):
+    ifc_file = ifcopenshell.open(ifc_path)
+    doors = []
+    for door in ifc_file.by_type('IfcDoor'):
+        props = {
+            'Mark': getattr(door, 'Tag', ''),
+            'Level': util.get_element_pset(door, 'Pset_DoorCommon', 'ReferenceLevel'),
+            'Rough Height': util.get_element_pset(door, 'Pset_DoorCommon', 'OverallHeight'),
+            'Rough Width': util.get_element_pset(door, 'Pset_DoorCommon', 'OverallWidth'),
+            'Family': getattr(door, 'ObjectType', ''),
+            'Type': getattr(door, 'Name', '')
+        }
+        doors.append(props)
+    return pd.DataFrame(doors)
+
+# Similar functions for columns (IfcColumn) and floors (IfcSlab)
+
+# Upload IFC file
+print("Upload IFC file after export:")
+ifc_file_upload = files.upload()
+ifc_path = list(ifc_file_upload.keys())[0]
+door_after_ifc = extract_doors_from_ifc(ifc_path)
+print(door_after_ifc.head())
+"""
+
+# %% [markdown]
+# ### 5. Summary Report
+# 
+# Compile all results into a single table and save as CSV.
+
+# %%
+summary_data = {
+    'Element': ['Doors', 'Structural Columns', 'Floors'],
+    'Overall DFLR (%)': [overall_dflr_doors, overall_dflr_cols, overall_dflr_floors],
+    'Record Fidelity (%)': [record_fid_doors, record_fid_cols, record_fid_floors]
+}
+summary_df = pd.DataFrame(summary_data)
+print("\n=== SUMMARY OF DFLR RESULTS ===")
+print(summary_df)
+
+# Optionally download summary
+summary_df.to_csv('DFLR_summary.csv', index=False)
+files.download('DFLR_summary.csv')
+
+# %% [markdown]
+# ### 6. Interpretation
+# 
+# - **Low DFLR (0–30%)** – Good data preservation.
+# - **Moderate DFLR (30–60%)** – Some parameters lost; check mapping.
+# - **High DFLR (>60%)** – Critical loss; requires custom IFC export settings and property sets.
+# 
+# Based on your research, simple elements (doors) lose 25‑50%, while complex elements (floors) can lose up to 67% under default IFC4 settings. Use custom mapping (see `NEW MAPPING FILE.txt`) to improve fidelity.
+# 
+# **Next Steps:**  
+# - Adjust the parameter lists and key columns to match your exact schedule headers.  
+# - Use the optional IFC extraction code to automate the after‑export data preparation.
